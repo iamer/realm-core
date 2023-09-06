@@ -1,0 +1,129 @@
+name: Pull request build and test
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+concurrency:
+  group: ${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+  build:
+    name: Build for ${{ matrix.variant.os }} ${{ matrix.variant.arch }}
+    runs-on: ${{ matrix.variant.runner }}
+    # if container is not set for a variant, this is a noop
+    container: ${{ matrix.variant.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - { os: linux, runner: ubuntu-latest, arch: x64, buildtype: debug }
+          #- { os: linux, runner: ubuntu-latest, arch: arm }
+          #- { os: linux, runner: ubuntu-latest, arch: arm64 }
+          - { os: windows, runner: windows-latest, arch: x64, buildtype: debug }
+          #- { os: windows, runner: windows-latest, arch: ia32 }
+          #- { os: android, runner: ubuntu-latest, arch: x86_64 }
+          #- { os: android, runner: ubuntu-latest, arch: armeabi-v7a }
+          #- { os: android, runner: ubuntu-latest, arch: arm64-v8a }
+          #- { os: android, runner: ubuntu-latest, arch: x86 }
+          #- { os: darwin, runner: macos-latest, arch: x64 }
+          #- { os: darwin, runner: macos-latest, arch: arm64 }
+          #- { os: ios, runner: macos-latest, arch: simulator }
+          #- { os: ios, runner: macos-latest, arch: catalyst }
+          #- { os: ios, runner: macos-latest, arch: ios }
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          submodules: "recursive"
+
+      - name: MSVC Setup
+        if: ${{ runner.os == 'Windows' }}
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Linux Environment setup
+        if: ${{ matrix.variant.runner == 'ubuntu-latest' }}
+        run: sudo apt-get install ccache ninja-build
+
+      - name: Setup Java
+        if: ${{ matrix.variant.os == 'android' }}
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'zulu' # See 'Supported distributions' for available options
+          java-version: '11'
+
+      - name: Setup Android SDK
+        if: ${{ matrix.variant.os == 'android' }}
+        uses: android-actions/setup-android@v2
+
+      - name: Install NDK
+        if: ${{ matrix.variant.os == 'android' }}
+        run: sdkmanager --install "ndk;${{ env.NDK_VERSION }}"
+
+      # The ccache installed by github doesn't want to be moved around. Let the ccache action download a new one.
+      - name: Remove pre-installed ccache
+        if: ${{ runner.os == 'Windows' }}
+        shell: bash
+        # There are two; remove both
+        run: |
+          rm -fv $(which ccache)
+          rm -fv $(which ccache)
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: ${{ runner.os }}-${{ matrix.variant.os }}-${{ matrix.variant.arch }}
+          max-size: '2.0G'
+
+      - name: Prepend ccache executables to the PATH
+        if: ${{ runner.os != 'Windows' }}
+        run: |
+          echo "/usr/lib/ccache:/usr/local/opt/ccache/libexec" >> $GITHUB_PATH
+
+      # in CI file timestamps change with every run so instead rely on file content hashing
+      # https://reactnative.dev/docs/build-speed#using-this-approach-on-a-ci
+      - name: Configure ccache
+        run: ccache --set-config="compiler_check=content"
+
+      - name: Insert ccache executables
+        if: ${{ runner.os == 'Windows' }}
+        shell: bash
+        run: |
+          cl_exe=$(which cl.exe)
+          cl_dir=$(dirname "$cl_exe")
+          # For 32-bit it uses a different compiler than the one in the path
+          if [ ${{ matrix.variant.arch }} = ia32 ]; then
+              cl_dir=$(dirname "$cl_dir")/x86
+              cl_exe="$cl_dir/cl.exe"
+          fi
+          cl_dir_windows="C:${cl_dir#/c}"
+          mv -v "$cl_exe" "$cl_dir"/cl-real.exe
+          cp -v "$cl_dir"/cl.exe.config "$cl_dir"/cl-real.exe.config
+          ccache_exe=$(which ccache.exe)
+          cp -v "$ccache_exe" "$cl_dir"/cl.exe
+          ls -l "$cl_dir"
+          echo "CCACHE_COMPILER=$cl_dir_windows/cl-real.exe" >> $GITHUB_ENV
+          echo 'CCACHE_COMPILERTYPE=msvc' >> $GITHUB_ENV
+          echo 'CCACHE_STATSLOG=C:\Users\runneradmin\ccache\statslog.txt' >> $GITHUB_ENV
+          #echo 'CCACHE_LOGFILE=C:\Users\runneradmin\ccache\logfile.txt' >> $GITHUB_ENV
+          # This tells msbuild to compile only one file at a time; ccache needs that.
+          echo 'UseMultiToolTask=true' >> $GITHUB_ENV
+          echo 'VCPKG_KEEP_ENV_VARS=CCACHE_COMPILER;CCACHE_STATSLOG;CCACHE_LOGFILE;CCACHE_COMPILERTYPE;UseMultiToolTask' >> $GITHUB_ENV
+
+      - name: Build 
+        if: ${{ (matrix.variant.os == 'linux') || (matrix.variant.os == 'windows') }}
+        run: |
+          mkdir build
+          cd build
+          cmake -D CMAKE_BUILD_TYPE= ${{ matrix.variant.buildtype }}..
+          cmake --build .
+          ctest
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: realm-core-builds
+          path: |
+            README.md
+
